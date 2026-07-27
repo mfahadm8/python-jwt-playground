@@ -1,0 +1,164 @@
+name: Temporary CMS Marketplace PUF Artifact Splitter
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  actions: read
+  contents: write
+  pull-requests: write
+
+jobs:
+  split:
+    if: startsWith(github.head_ref, 'automation/cms-puf-artifact-split-')
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Download and validate complete source artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p source output
+
+          curl -fL \
+            --connect-timeout 30 \
+            --max-time 3600 \
+            --retry 8 \
+            --retry-all-errors \
+            --retry-delay 3 \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/artifacts/8659162635/zip" \
+            -o source/source-artifact.zip
+
+          unzip -q source/source-artifact.zip -d source/unpacked
+          ARCHIVE="source/unpacked/cms_marketplace_public_use_files_2014_2026.zip"
+          test -f "$ARCHIVE"
+          test "$(stat -c '%s' "$ARCHIVE")" = "572694037"
+          echo "6fbd701838972410e7d7dc1b7c5f73797d6a795f8511e114ae0f6e24488ffad1  $ARCHIVE" \
+            | sha256sum --check
+
+          python - <<'PY'
+          import json
+          import zipfile
+          from pathlib import Path
+
+          archive = Path("source/unpacked/cms_marketplace_public_use_files_2014_2026.zip")
+          with zipfile.ZipFile(archive) as zf:
+              bad = zf.testzip()
+              if bad is not None:
+                  raise SystemExit(f"Corrupt member: {bad}")
+              manifest = json.loads(zf.read("metadata/manifest.json"))
+              if not isinstance(manifest, list) or len(manifest) != 145:
+                  raise SystemExit("Expected a 145-entry source manifest")
+          print("Complete CMS ZIP and 145-entry manifest verified")
+          PY
+
+      - name: Split archive into connector-sized transfer parts
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARCHIVE="source/unpacked/cms_marketplace_public_use_files_2014_2026.zip"
+          PREFIX="output/cms_marketplace_public_use_files_2014_2026.zip.part"
+          split \
+            --bytes=200000000 \
+            --numeric-suffixes=1 \
+            --suffix-length=3 \
+            "$ARCHIVE" \
+            "$PREFIX"
+
+          test "$(find output -maxdepth 1 -type f -name '*.part*' | wc -l)" = "3"
+
+          python - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+
+          output = Path("output")
+          chunks = []
+          for path in sorted(output.glob("*.part*")):
+              digest = hashlib.sha256()
+              with path.open("rb") as stream:
+                  while block := stream.read(4 * 1024 * 1024):
+                      digest.update(block)
+              chunks.append({
+                  "filename": path.name,
+                  "bytes": path.stat().st_size,
+                  "sha256": digest.hexdigest(),
+              })
+          manifest = {
+              "archive_name": "cms_marketplace_public_use_files_2014_2026.zip",
+              "archive_bytes": 572694037,
+              "archive_sha256": "6fbd701838972410e7d7dc1b7c5f73797d6a795f8511e114ae0f6e24488ffad1",
+              "source_file_count": 145,
+              "chunks": chunks,
+          }
+          (output / "transfer-manifest.json").write_text(
+              json.dumps(manifest, indent=2), encoding="utf-8"
+          )
+          print(json.dumps(manifest, indent=2))
+          PY
+
+      - name: Upload transfer part 1
+        uses: actions/upload-artifact@v4
+        with:
+          name: cms-marketplace-puf-transfer-part-001
+          path: output/cms_marketplace_public_use_files_2014_2026.zip.part001
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+      - name: Upload transfer part 2
+        uses: actions/upload-artifact@v4
+        with:
+          name: cms-marketplace-puf-transfer-part-002
+          path: output/cms_marketplace_public_use_files_2014_2026.zip.part002
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+      - name: Upload transfer part 3
+        uses: actions/upload-artifact@v4
+        with:
+          name: cms-marketplace-puf-transfer-part-003
+          path: output/cms_marketplace_public_use_files_2014_2026.zip.part003
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+      - name: Upload transfer manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: cms-marketplace-puf-transfer-manifest
+          path: output/transfer-manifest.json
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+      - name: Close temporary PR and delete temporary branch
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        shell: bash
+        run: |
+          set +e
+          curl -fsS -X PATCH \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" \
+            -d '{"state":"closed"}' >/dev/null
+
+          curl -fsS -X DELETE \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/git/refs/heads/$GITHUB_HEAD_REF" >/dev/null
+          exit 0
