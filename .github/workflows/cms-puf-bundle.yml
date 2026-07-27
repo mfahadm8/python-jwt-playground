@@ -1,9 +1,9 @@
 name: Temporary CMS Marketplace PUF Bundle
 
 on:
-  push:
+  pull_request:
     branches:
-      - automation/cms-puf-bundle-20260727-a2
+      - main
 
 permissions:
   contents: write
@@ -12,11 +12,11 @@ permissions:
   actions: write
 
 env:
-  PR_NUMBER: "2"
+  PR_NUMBER: ${{ github.event.pull_request.number }}
 
 jobs:
   bundle:
-    if: startsWith(github.ref_name, 'automation/cms-puf-bundle-')
+    if: startsWith(github.head_ref, 'automation/cms-puf-bundle-')
     runs-on: ubuntu-latest
     timeout-minutes: 355
 
@@ -134,7 +134,7 @@ jobs:
           exit 1
 
       - name: Remove temporary comment, close PR, and delete branch
-        if: always()
+        if: success()
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -176,5 +176,5 @@ jobs:
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
-            "https://api.github.com/repos/$GITHUB_REPOSITORY/git/refs/heads/$GITHUB_REF_NAME" >/dev/null
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/git/refs/heads/$GITHUB_HEAD_REF" >/dev/null
           exit 0
