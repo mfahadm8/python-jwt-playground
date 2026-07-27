@@ -1,0 +1,177 @@
+name: Temporary CMS Marketplace PUF Bundle
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  actions: write
+
+jobs:
+  bundle:
+    if: startsWith(github.head_ref, 'automation/cms-puf-bundle-')
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+
+    steps:
+      - name: Check out temporary branch
+        uses: actions/checkout@v4
+
+      - name: Restore and validate the temporary bundler
+        shell: bash
+        run: |
+          set -euo pipefail
+          base64 --decode .github/scripts/cms_puf_bundle.py.gz.b64 | gzip --decompress > /tmp/cms_puf_bundle.py
+          echo "e0e15773c777024536e2f777b71e4e3e22e91aba3463363894dce1ec2ffc26fe  /tmp/cms_puf_bundle.py" | sha256sum --check
+          python -m py_compile /tmp/cms_puf_bundle.py
+
+      - name: Install bundler dependencies
+        run: python -m pip install --disable-pip-version-check requests beautifulsoup4
+
+      - name: Download, verify, and package every CMS source file
+        run: python /tmp/cms_puf_bundle.py build
+
+      - name: Open a temporary authenticated transfer tunnel
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          curl -fsSL --retry 5 --retry-all-errors \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+            -o cloudflared
+          chmod +x cloudflared
+
+          RUNNER_TRACKING_ID=cms-puf-persistent \
+            nohup python /tmp/cms_puf_bundle.py serve --port 8765 \
+            > cms-server.log 2>&1 &
+          echo "$!" > cms-server.pid
+
+          for _ in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8765/health >/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8765/health >/dev/null
+
+          RUNNER_TRACKING_ID=cms-puf-persistent \
+            nohup ./cloudflared tunnel --url http://127.0.0.1:8765 --no-autoupdate \
+            > cloudflared.log 2>&1 &
+          echo "$!" > cloudflared.pid
+
+          TUNNEL_URL=""
+          for _ in $(seq 1 180); do
+            TUNNEL_URL=$(grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' cloudflared.log | head -n 1 || true)
+            if [[ -n "$TUNNEL_URL" ]] && curl -fsS --retry 2 "$TUNNEL_URL/health" >/dev/null; then
+              break
+            fi
+            sleep 2
+          done
+          if [[ -z "$TUNNEL_URL" ]]; then
+            echo "Cloudflare quick tunnel URL was not established" >&2
+            tail -n 100 cloudflared.log >&2 || true
+            exit 1
+          fi
+          curl -fsS "$TUNNEL_URL/health" >/dev/null
+
+          python /tmp/cms_puf_bundle.py tunnel-info --base-url "$TUNNEL_URL"
+
+          COMMENT_BODY=$(printf 'CMS_BUNDLE_TUNNEL\n```json\n%s\n```' "$(cat output/tunnel-info.json)")
+          COMMENT_PAYLOAD=$(jq -n --arg body "$COMMENT_BODY" '{body: $body}')
+          if COMMENT_RESPONSE=$(curl -fsS \
+            -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/issues/${{ github.event.pull_request.number }}/comments" \
+            -d "$COMMENT_PAYLOAD"); then
+            echo "$COMMENT_RESPONSE" | jq -r '.id' > output/comment-id.txt
+            echo "Temporary transfer endpoint published to the workflow control comment."
+          else
+            echo "Workflow comment could not be posted; the transfer-info artifact remains available." >&2
+          fi
+
+      - name: Publish temporary transfer instructions
+        uses: actions/upload-artifact@v4
+        with:
+          name: cms-puf-transfer-info
+          path: output/tunnel-info.json
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+      - name: Keep transfer endpoint available until integrity verification completes
+        shell: bash
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 19000); do
+            if [[ -f output/.download-complete ]]; then
+              echo "Verified transfer completion signal received."
+              exit 0
+            fi
+            if ! kill -0 "$(cat cms-server.pid)" 2>/dev/null; then
+              echo "Temporary file server stopped unexpectedly" >&2
+              tail -n 100 cms-server.log >&2 || true
+              exit 1
+            fi
+            if ! kill -0 "$(cat cloudflared.pid)" 2>/dev/null; then
+              echo "Temporary tunnel stopped unexpectedly" >&2
+              tail -n 100 cloudflared.log >&2 || true
+              exit 1
+            fi
+            sleep 1
+          done
+          echo "Transfer completion signal was not received before the safety timeout" >&2
+          exit 1
+
+      - name: Remove temporary comment, close PR, and delete branch
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set +e
+          [[ -f cloudflared.pid ]] && kill "$(cat cloudflared.pid)" 2>/dev/null
+          [[ -f cms-server.pid ]] && kill "$(cat cms-server.pid)" 2>/dev/null
+
+          if [[ -s output/comment-id.txt ]]; then
+            COMMENT_ID=$(cat output/comment-id.txt)
+            curl -fsS -X DELETE \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/$GITHUB_REPOSITORY/issues/comments/$COMMENT_ID" >/dev/null
+          fi
+
+          curl -fsS -X PATCH \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/pulls/${{ github.event.pull_request.number }}" \
+            -d '{"state":"closed"}' >/dev/null
+
+          for ARTIFACT_ID in $(curl -fsS \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts" \
+            | jq -r '.artifacts[].id'); do
+            curl -fsS -X DELETE \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID" >/dev/null
+          done
+
+          curl -fsS -X DELETE \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/git/refs/heads/$GITHUB_HEAD_REF" >/dev/null
+          exit 0
